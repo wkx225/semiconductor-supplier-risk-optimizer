@@ -1,260 +1,187 @@
-# Supplier selection, order allocation & disruption resilience
+# 半导体关键物料供应商风险评估与韧性订单分配
 
-A working reimplementation of the supplier selection core from Yousefi,
-Jahangoshai Rezaee & Solimanpur (2021), extended with the question their
-deterministic model can't answer: when a supplier fails *after* orders are
-committed, how much does diversification cost, and how much service does it
-save?
+这是一个面向制造业采购场景的个人项目。项目基于固定随机种子生成的模拟采购订单，完成供应商绩效指标计算、可解释风险评分、风险约束订单分配和停供压力测试，并通过 Streamlit 提供可交互的决策看板。
 
-**Live demo:** https://supplier-resilience-demo-6fuayogumnszf6bneytvbc.streamlit.app/
+> 数据声明：所有供应商、订单、价格和采购金额均为模拟数据，不代表任何真实企业或业务结果。
 
-![Python](https://img.shields.io/badge/python-3.10%2B-blue)
-![License](https://img.shields.io/badge/license-MIT-lightgrey)
+![供应商风险总览](docs/images/dashboard_overview.png)
+## 项目解决什么问题
 
-## The problem
+采购决策不能只回答“哪家供应商价格最低”，还需要同时考虑交付、质量、供货、价格、合规和供应集中度。本项目围绕一条完整业务链展开：
 
-A buyer placing a year's order across several suppliers faces three coupled
-decisions where "cheapest" and "safest" pull in opposite directions:
-
-1. **Who supplies what, and how much?** pour everything into the cheapest
-   vendor, or spread the order across more efficient and reliable ones?
-2. **What is that spread actually worth?** diversification costs more up
-   front, but how much *service* does it save when a supplier fails *after*
-   orders are committed? A deterministic cost model never sees this trade off.
-3. **What price to pay?** once quantities are fixed, the unit price is
-   negotiated, and each supplier has a point below which it walks away.
-
-This project answers all three on one forecast: demand is predicted (Prophet),
-suppliers are scored on cost *and* quality/reliability (DEA), quantities come
-from a multi-objective MILP, the plan is stress tested against a post commit
-disruption, and the price is settled with a Nash bargaining game. The result
-is a decision that **trades off cost, supplier quality, and disruption
-resilience explicitly**, instead of optimising cost alone and discovering the
-fragility too late.
-
-## Pipeline at a glance
-
-<p align="center">
-  <img src="docs/pipeline_overview.svg" alt="Top-down pipeline: a supplier pool and demand history feed DEA scoring and a Prophet forecast, which feed Stage 1 order allocation; Stage 1 feeds both a Stage 2 Nash pricing game and a resilience stress test, producing the final plan." width="640">
-</p>
-
-The whole thing is **built around the two-stage hybrid model** of Yousefi et al.
-(2021), the purple core in the diagram:
-
-- **Stage 1 · allocation** decides *who supplies how much*, using a
-  multi-objective MILP that balances cost against supplier efficiency.
-- **Stage 2 · pricing** then settles *what price to pay* for those quantities
-  through a Nash bargaining game.
-
-Everything else is scaffolding around that core, colour-coded by where it comes
-from. The **beige inputs** prepare what the two stages need: a **supplier pool**
-(costs, quality, capacity) scored by **DEA** into efficiency-per-dollar, and a
-**demand history** (real UCI data, or the synthetic fallback) that the
-**Prophet forecast** turns into an annual demand figure with an uncertainty range.
-The **orange resilience test** is the half this project adds on top of the
-paper: it knocks out a supplier *after* Stage 1 has committed the orders and
-measures the service that survives, which is the trade off a deterministic model
-never sees. Read top to bottom, data flows from the two inputs down through
-scoring/forecasting, into Stage 1, and out through Stage 2 and the stress test
-to a **final plan** of quantities and prices.
-
-(For the file-level version of this same flow, showing which module produces
-what, see [How the pieces fit](#how-the-pieces-fit) below.)
-
-## Background
-
-> Yousefi, S., Jahangoshai Rezaee, M., & Solimanpur, M. (2021). Supplier
-> selection and order allocation using two stage hybrid supply chain model and
-> game-based order price. *Operational Research, 21*(1), 553-588.
-
-The original is a two-stage model: Stage 1 fuses a buyer/vendor coordination
-model with DEA so orders flow to *efficient* suppliers (not just cheap ones),
-and Stage 2 sets the price through a Nash bargaining game. It's deterministic
-end to end: demand is a given constant and no supplier ever fails. This repo
-keeps the recognisable Stage-1 structure and fills in both gaps.
-
-## What's here
-
-**Forecast driven Stage 1** (`online_retail.py`, `forecast.py`, `stage1.py`).
-Instead of taking demand as given, I fit Prophet on a **real** demand series —
-the total daily order volume of a UK online retailer (UCI Online Retail II,
-Dec 2009–Dec 2011, ~6.2M units/year) and feed the annual forecast D into a
-MILP that picks suppliers and quantities. (`demand_data.py` keeps a synthetic
-generator as an offline fallback.) A note on what real data costs you: I first
-tried forecasting a single consistently ordered product to keep a literal
-"one item" reading, but single product retail demand is far too spiky
-Prophet returned a negative point estimate or a band ±5× the mean. The total
-volume averages that noise out and has a clean multiplicative holiday swing
-Prophet fits to within ~1% of the historical mean, so the buyer's problem
-becomes sourcing the retailer's aggregate volume. Two objectives, combined
-with the weighted global criterion method:
-
-- Z1: total annual cost (purchasing + holding + setup)
-- Z2: sum of DEA efficiency scores of the selected suppliers
-
-`risk_sweep()` re-solves across 10 weight settings and plots the Pareto
-frontier. One thing I learned the hard way: normalising each objective by its
-ideal value makes the sweep collapse to about 3 distinct solutions, because
-cost only moves ~5% off its ideal while the efficiency sum moves ~80%. You
-have to normalise by the ideal-to-nadir *range* to get an even sweep.
-
-`disruption_service()` then runs every plan on that frontier through the
-stress test with S01 (the cheap workhorse every cost leaning plan relies on)
-knocked out after orders are committed. That adds the third axis the 2021
-model can't draw: the cost only plan keeps 17% service, the fully
-diversified one 34%, and the curve between them prices the insurance
-(`resilience_frontier.png`).
-
-**Resilience extension** (`allocation.py`). A share cap and a minimum
-supplier count force diversification, and `stress_test()` knocks out a
-supplier after orders are committed. With the default 6 supplier data,
-demand of 1,000 units and the high-volume supplier S6 failing:
-
-| Plan | Purchasing cost | Suppliers | Service when S6 fails |
-|------|----------------:|:---------:|:---------------------:|
-| Cost-only | $8,150 | 2 | 30% |
-| Resilient (max 40% share, min 3 suppliers) | $8,400 | 3 | 60% |
-
-So a 3% cost premium doubles realised service under that disruption. That
-trade-off is invisible to a deterministic model, which is the whole point.
-
-**Stage 2: Nash bargaining over price** (`stage2.py`). Pulls q* from Stage 1,
-prices the no negotiation baseline, sets the buyer's budget at 95% of it (so
-a negotiation is forced), gives every supplier a walk-away profit floor, and
-then solves the bargaining game with scipy (SLSQP, budget and floors as
-explicit constraints): prices in [floor, list] maximising the Nash product
-of all utilities. Because the utilities are linear in price, the symmetric
-game has a closed-form answer (equal split of the surplus) that the optimiser
-is tested against; the interesting version is the *weighted* game, where
-bargaining power follows volume share, S01 carries 85% of the demand and
-walks away with 85% of the supplier-side surplus. The whole step is wrapped
-in a `GameTheoryPricingEngine` that returns a before/after dashboard, the
-total savings ($2.6M, ~5.2% off a $50M list-price bill), and each supplier's
-profit sacrifice.
-
-**Fuzzy Cognitive Map** (`fcm.py`, `fcm_data.py`). A signed causal graph of
-resilience and sustainability enablers (blockchain traceability, supplier
-diversification, visibility, disruption risk, ...) with the standard sigmoid
-state propagation, scenario clamping, and a Nonlinear Hebbian Learning step.
-This connects the allocation work to the FCM methodology in Yousefi &
-Mohamadpour Tosarkani (2022, 2024); the weights here are expert-defined, not
-learned, and the NHL step is one rule out of their full hybrid algorithm.
-
-## How the pieces fit
-
-```
-online_retail.py ──► demand_history.csv ──► forecast.py ──► D ± interval ──┐
-   (UCI real data)   (demand_data.py = fallback)                           ├──► stage1.py ──► q*, selected ──► stage2.py
-suppliers_config.py ──► dea.py ──► efficiency ─────────────────────────────┘         │
-                                                                                     └──► pareto_frontier.png
-
-data.py ──► dea.py + allocation.py ──► app.py (interactive demo, 6-supplier case)
-fcm_data.py ──► fcm.py ──────────────► app.py (causal map tab)
+```text
+采购订单 → 供应商KPI → 五维风险评分 → MILP订单分配 → 停供压力测试 → 交互式看板
 ```
 
-The two paths share `dea.py` and the same modelling ideas but different
-supplier pools: the Streamlit demo keeps the small 6 supplier case so every
-number is checkable by hand, the stage-1/2 pipeline uses the 10 supplier
-pool and the real forecasted demand.
+核心问题包括：
 
-The reasoning behind the less obvious modelling choices (why range
-normalisation, why capacity is not a DEA output, why the budget sits at 95%)
-is in [docs/decisions.md](docs/decisions.md).
+- 哪些供应商当前风险较高，风险主要来自哪个维度？
+- 如何在产能、MOQ、MPQ和风险限制下分配采购量？
+- 降低单一供应商依赖需要增加多少采购成本？
+- 最大供应商完全停供后，原订单组合还能保障多少需求？
 
-## Running it
+## 数据规模与核心结果
+
+- 30家模拟供应商，覆盖5类半导体关键物料；
+- 1,800笔模拟采购订单，每家供应商60笔；
+- 约4.65亿元模拟采购支出；
+- 识别3家高风险供应商和9家中风险供应商；
+- MCU控制芯片默认情景下，风险约束方案相对最低成本方案：
+  - 采购成本增加0.78%；
+  - 组合平均风险分由41.94降至29.99；
+  - 最大供应商份额由96.67%降至40.00%；
+  - 最大供应商停供后的供应保障率由3.33%提高至60.00%。
+
+### 参数敏感性检查
+
+在年度需求60万件、至少启用3家供应商、风险准入上限60分的条件下：
+
+| 情景 | 风险约束方案成本 | 组合平均风险分 | 最大供应商份额 | 停供保障率 |
+|---|---:|---:|---:|---:|
+| 默认：份额上限40%、平均风险上限30 | 1,961.85万元 | 29.99 | 40% | 60% |
+| 放宽份额上限至50% | 1,959.40万元 | 29.99 | 50% | 50% |
+| 收紧份额上限至35% | 1,963.26万元 | 28.32 | 35% | 65% |
+| 收紧平均风险上限至20 | 1,982.84万元 | 20.00 | 40% | 60% |
+
+结果表明，放宽集中度限制可以小幅降低采购成本，但会降低停供后的供应保障能力；收紧集中度或风险限制能够提高韧性或降低组合风险，但需要付出一定成本。
+### 订单分配优化看板
+
+![风险约束订单分配](docs/images/allocation_optimization.png)
+
+## 方法说明
+
+### 1. 供应商KPI
+
+使用 Pandas 从采购订单中计算：
+
+- 准时交付率与延期率；
+- 平均延期天数；
+- 到货满足率；
+- 质量拒收率；
+- 实际采购价格波动系数；
+- 非合同采购占比。
+
+### 2. 可解释风险评分
+
+各指标先使用 Min-Max 方法转换为当前供应商群体内的相对风险，再按下列权重加总：
+
+| 风险维度 | 指标 | 权重 |
+|---|---|---:|
+| 交付风险 | 延期率 | 30% |
+| 质量风险 | 质量拒收率 | 25% |
+| 供货风险 | 未足量到货率 | 15% |
+| 价格风险 | 价格波动系数 | 15% |
+| 合规风险 | 非合同采购占比 | 15% |
+
+风险分是当前模拟供应商群体中的相对风险，不代表真实断供概率，也不能直接替代供应商现场审核。
+### 单家供应商风险拆解
+
+![供应商风险来源分析](docs/images/supplier_risk_detail.png)
+
+### 3. 风险约束订单分配
+
+使用 PuLP 构建混合整数线性规划（MILP，Mixed-Integer Linear Programming）模型，并调用 CBC 求解器。模型以采购成本最小为目标，同时满足：
+
+- 总采购量等于年度需求；
+- 单家采购量不超过年度产能；
+- 启用供应商后必须达到MOQ（Minimum Order Quantity，最小起订量）；
+- 采购量必须为MPQ（Minimum Package Quantity，最小包装批量）的整数倍；
+- 单一供应商份额不超过设定上限；
+- 至少启用指定数量的供应商；
+- 超过风险准入上限的供应商不能进入风险约束方案；
+- 采购量加权平均风险分不超过设定上限。
+
+### 4. 停供压力测试
+
+压力测试假定当前方案中采购量最大的供应商完全停供，且已承诺订单不能临时转移。停供保障率表示其他供应商原有订单仍可覆盖的需求比例。
+
+这一指标衡量的是既定订单组合的静态抗冲击能力，不等同于考虑应急转单、库存缓冲或替代料后的实际恢复能力。
+
+## 项目结构
+
+```text
+.
+├── data/
+│   ├── suppliers.csv
+│   ├── purchase_orders.csv
+│   ├── supplier_kpi.csv
+│   ├── supplier_risk_score.csv
+│   ├── allocation_details.csv
+│   └── allocation_summary.csv
+├── generate_semiconductor_data.py
+├── validate_semiconductor_data.py
+├── calculate_supplier_kpi.py
+├── calculate_risk_score.py
+├── optimize_semiconductor_allocation.py
+├── run_pipeline.py
+├── risk_dashboard.py
+├── requirements.txt
+└── LICENSE
+```
+
+## 运行方式
+
+建议使用 Python 3.10 或以上版本。
+
+### 1. 安装依赖
 
 ```bash
-git clone https://github.com/nabindev3/supplier-resilience-demo.git
-cd supplier-resilience-demo
-pip install -r requirements.txt
-
-streamlit run app.py     # interactive demo (allocation + FCM + Nash tab)
-python online_retail.py  # (re)build demand_history.csv from the UCI dataset
-python stage1.py         # forecast + DEA + weight sweep + pareto_frontier.png
-python stage2.py         # bargaining-game setup on top of stage 1
-python test_model.py     # smoke tests
+python -m venv .venv
 ```
 
-The real `demand_history.csv` is committed, so nothing needs downloading to
-run the pipeline. `python online_retail.py` regenerates it from the UCI
-dataset (fetching the ~44MB workbook into `data_raw/` on first call); pass a
-StockCode to inspect a single product instead of the total. The first forecast
-fits Prophet and caches the result in `.annual_demand_cache.json` (keyed on a
-hash of the data), so later runs of stage1.py/stage2.py are near-instant;
-editing the CSV invalidates the cache automatically.
+Windows PowerShell：
 
-## Files
+```powershell
+.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
 
-| File | What it does |
-|------|--------------|
-| `online_retail.py` | builds `demand_history.csv` from the real UCI Online Retail II data |
-| `demand_data.py` | synthetic 5-year daily demand history (offline fallback) |
-| `forecast.py` | Prophet fit, annual demand D with 90% interval |
-| `suppliers_config.py` | 10-supplier candidate pool for stage 1 |
-| `stage1.py` | DEA + multi-objective MILP, weight sweep, Pareto + resilience plots |
-| `stage2.py` | Nash bargaining game over price (symmetric + volume-weighted, scipy) |
-| `data.py` | original 6-supplier case for the interactive demo |
-| `dea.py` | input-oriented CCR DEA, one LP per supplier |
-| `allocation.py` | allocation MILP + post-commit stress test |
-| `fcm.py`, `fcm_data.py` | Fuzzy Cognitive Map engine and the causal map |
-| `app.py` | Streamlit UI |
-| `test_model.py` | smoke tests |
+macOS或Linux：
 
-## Limitations
+```bash
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
 
-- Demand is real (UCI Online Retail II), but the **supplier** data is not.
-  Real procurement data unit cost, and especially each supplier's
-  *production cost*, the number the Nash game bargains over is commercially
-  confidential and essentially never public, so the 10-supplier pool stays a
-  calibrated assumption. Its scale-dependent fields (capacity, min order,
-  setup cost) were scaled to match the real ~6.2M-unit demand; the per-unit
-  economics are illustrative, with margins set on a deliberate gradient (see
-  [docs/decisions.md](docs/decisions.md)).
-- DEA is plain CCR (constant returns to scale), no super-efficiency variant.
-- Single-period, single supplier deterministic disruption. Scenario-based or
-  stochastic disruptions would be the natural next step.
-- The Stage-2 game uses transferable, risk-neutral utilities (linear in
-  price), which is what makes the symmetric solution an exact equal split.
-  Concave/risk-averse utilities would be a more realistic and genuinely
-  non-linear extension.
+### 2. 重新生成全部数据与结果
 
-## What's next
+```bash
+python run_pipeline.py
+```
 
-Roughly in order:
+该命令会依次执行模拟数据生成、数据质量检查、KPI计算、风险评分和订单分配优化。固定随机种子保证结果可复现。
 
-1. ~~Replace the synthetic series with a public demand dataset.~~ **Done** —
-   the pipeline now forecasts UCI Online Retail II. The next step is sourcing
-   real *supplier* attributes (the harder half), or at least calibrating the
-   pool's per-unit economics against a published supplier-selection case study.
-2. Try other bargaining-power definitions in the weighted Nash game (DEA
-   efficiency, switching cost) and see how the negotiated prices move.
-3. Multi-supplier and partial disruption scenarios for the resilience sweep,
-   instead of the single S01-down case.
-4. Learn the FCM weights from scenario data instead of fixing them by hand
-   (the full hybrid-learning loop from the 2022 paper).
+### 3. 启动交互式看板
 
-## References
+```bash
+python -m streamlit run risk_dashboard.py
+```
 
-Yousefi, S., Jahangoshai Rezaee, M., & Solimanpur, M. (2021). Supplier
-selection and order allocation using two-stage hybrid supply chain model and
-game-based order price. *Operational Research, 21*(1), 553-588.
+浏览器打开终端显示的本地地址后，可以调整年度需求、单家份额上限、供应商数量、组合风险上限和风险准入上限，模型会自动重新求解。
 
-Yousefi, S., & Mohamadpour Tosarkani, B. (2022). An analytical approach for
-evaluating the impact of blockchain technology on sustainable supply chain
-performance. *International Journal of Production Economics, 246*, 108429.
+## 文件说明
 
-Yousefi, S., & Mohamadpour Tosarkani, B. (2024). Enhancing sustainable supply
-chain readiness to adopt blockchain: A decision support approach for barriers
-analysis. *Engineering Applications of Artificial Intelligence.*
+| 文件 | 作用 |
+|---|---|
+| `generate_semiconductor_data.py` | 生成供应商主数据和1,800笔模拟采购订单 |
+| `validate_semiconductor_data.py` | 检查编号、缺失值、日期、数量、MOQ、MPQ等业务规则 |
+| `calculate_supplier_kpi.py` | 从订单明细计算供应商绩效指标 |
+| `calculate_risk_score.py` | 计算五维风险贡献、综合风险分和风险等级 |
+| `optimize_semiconductor_allocation.py` | 求解最低成本方案和风险约束方案并执行停供测试 |
+| `run_pipeline.py` | 按正确顺序运行完整数据与模型流程 |
+| `risk_dashboard.py` | 展示风险分布、风险拆解和订单分配情景分析 |
 
-## Data
+## 项目边界
 
-Demand is derived from the **Online Retail II** dataset (Chen, D., 2019; UCI
-Machine Learning Repository, [doi:10.24432/C5CG6D](https://doi.org/10.24432/C5CG6D)),
-licensed [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). The
-committed `demand_history.csv` is the retailer's total daily order volume
-aggregated from that dataset; `online_retail.py` regenerates it.
+- 所有业务数据均为模拟数据，结果用于方法展示，不能直接用于真实采购决策；
+- 风险评分权重为业务假设，真实应用中应结合专家判断、历史损失和企业风险偏好校准；
+- Min-Max评分依赖当前供应商群体，新增或删除供应商可能改变相对风险分；
+- 优化模型是单物料、单周期、确定性模型，尚未纳入库存、交期不确定性、替代料和多供应商同时中断；
+- 压力测试不考虑停供后的应急转单，因此反映的是订单承诺后的静态供应保障率。
 
-## License
+## 开源项目说明
 
-MIT, see [LICENSE](LICENSE).
+本项目由 [supplier-resilience-demo](https://github.com/nabindev3/supplier-resilience-demo) 改造而来。原项目围绕供应商选择、需求预测、DEA效率评价、订单分配和Nash议价展开；本版本聚焦制造业半导体采购场景，新增并重构了模拟订单数据、供应商KPI、可解释风险评分、风险约束MILP、停供压力测试和Streamlit交互看板。
+
+原项目采用MIT许可证。`LICENSE`中保留原作者版权声明；使用和再发布本项目时应继续保留该许可证及版权信息。
+
